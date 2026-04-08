@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import base64
+import html as _html
 import json
 import os
 import re
@@ -101,16 +102,25 @@ def open_daylio_backup(path: str) -> dict:
     return data
 
 
+_PREDEFINED_MOOD_NAMES = {1: "rad", 2: "good", 3: "meh", 4: "bad", 5: "awful"}
+
+
 def build_mood_map(custom_moods: list) -> dict:
-    """Return {mood_id: predefined_name} from the customMoods array."""
+    """Return {mood_id: mood_label_string} from the customMoods array.
+
+    Daylio stores moods with a `predefined_name_id` integer (1–5 for the five
+    standard moods, -1 for fully custom moods whose label is in `custom_name`).
+    """
     mood_map = {}
     for mood in custom_moods:
         mood_id = mood.get("id")
         if mood_id is None:
             continue
-        # predefined_name is e.g. "rad", "good", "meh", "bad", "awful"
-        name = mood.get("predefined_name") or mood.get("custom_name") or "unknown"
-        mood_map[mood_id] = name.lower().strip() or "unknown"
+        predefined_id = mood.get("predefined_name_id")
+        name = _PREDEFINED_MOOD_NAMES.get(predefined_id) or mood.get("custom_name", "")
+        name = name.lower().strip()
+        if name:
+            mood_map[mood_id] = name
     return mood_map
 
 
@@ -144,6 +154,37 @@ def sanitize_tag(name: str) -> str:
     return name or "tag"
 
 
+def html_to_markdown(text: str) -> str:
+    """Convert common HTML markup in Daylio notes to Markdown equivalents.
+
+    Handles the most common cases found in Daylio exports:
+    - HTML entities (&amp; &lt; etc.)
+    - <br> line breaks → newlines
+    - <p> paragraphs → blank-line-separated blocks
+    - <b>/<strong> → **bold**
+    - <i>/<em> → *italic*
+    - Any remaining tags are stripped
+    """
+    # Decode HTML entities first (&amp; → &, &lt; → <, &nbsp; → space, etc.)
+    text = _html.unescape(text)
+    # <br> variants → newline
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    # </p> → blank line; opening <p> → nothing
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<p[^>]*>", "", text, flags=re.IGNORECASE)
+    # <b>/<strong> → **bold**
+    text = re.sub(r"<(b|strong)[^>]*>(.*?)</(b|strong)>", r"**\2**",
+                  text, flags=re.IGNORECASE | re.DOTALL)
+    # <i>/<em> → *italic*
+    text = re.sub(r"<(i|em)[^>]*>(.*?)</(i|em)>", r"*\2*",
+                  text, flags=re.IGNORECASE | re.DOTALL)
+    # Strip any remaining HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Collapse 3+ consecutive newlines to 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def entry_to_timestamp(entry: dict) -> str:
     """
     Convert a Daylio entry's datetime (milliseconds) to an ISO 8601 UTC string.
@@ -167,8 +208,8 @@ def build_content(entry: dict, mood_map: dict, tag_map: dict, args: argparse.Nam
     """
     parts = []
 
-    title = (entry.get("note_title") or "").strip()
-    note = (entry.get("note") or "").strip()
+    title = html_to_markdown((entry.get("note_title") or "").strip())
+    note = html_to_markdown((entry.get("note") or "").strip())
 
     if title:
         parts.append(title)
@@ -181,9 +222,9 @@ def build_content(entry: dict, mood_map: dict, tag_map: dict, args: argparse.Nam
 
     if not args.skip_mood:
         mood_id = entry.get("mood")
-        mood_name = mood_map.get(mood_id, "unknown")
-        sanitized = sanitize_tag(mood_name)
-        hashtags.append(f"#mood-{sanitized}")
+        mood_name = mood_map.get(mood_id)  # None if unresolved — omit tag entirely
+        if mood_name:
+            hashtags.append(f"#mood-{sanitize_tag(mood_name)}")
 
     if not args.skip_tags:
         # Deduplicate tag IDs while preserving order
@@ -361,6 +402,18 @@ def run_import(args: argparse.Namespace) -> None:
     # --- Step 3: Sort entries oldest-first ---
     entries = sorted(entries, key=lambda e: e.get("datetime", 0))
 
+    # --- Step 3b: Filter content-empty entries if requested ---
+    skipped_empty = 0
+    if args.skip_empty:
+        before = len(entries)
+        entries = [
+            e for e in entries
+            if (e.get("note_title") or "").strip() or (e.get("note") or "").strip()
+        ]
+        skipped_empty = before - len(entries)
+        if skipped_empty:
+            print(f"Skipping {skipped_empty} content-empty entries (--skip-empty).")
+
     # --- Step 4: Import loop ---
     total = len(entries)
     succeeded = 0
@@ -436,10 +489,11 @@ def run_import(args: argparse.Namespace) -> None:
 
     # --- Step 5: Summary ---
     print()
+    skipped_note = f", {skipped_empty} skipped (empty)" if skipped_empty else ""
     if args.dry_run:
-        print(f"Dry run complete: {succeeded} entries would be imported.")
+        print(f"Dry run complete: {succeeded} entries would be imported{skipped_note}.")
     else:
-        print(f"Import complete: {succeeded} succeeded, {failed} failed.")
+        print(f"Import complete: {succeeded} succeeded, {failed} failed{skipped_note}.")
         if failed_entries:
             print("Failed entries:")
             for eid, dstr in failed_entries:
@@ -505,6 +559,14 @@ def parse_args() -> argparse.Namespace:
         "--skip-mood",
         action="store_true",
         help="Do not include the Daylio mood as a #mood-X hashtag in the memo content.",
+    )
+    parser.add_argument(
+        "--skip-empty",
+        action="store_true",
+        help=(
+            "Skip entries that have no note text or title (mood/tag-only entries). "
+            "Useful for excluding check-in entries that contain only a mood or activities."
+        ),
     )
     parser.add_argument(
         "--delay",
