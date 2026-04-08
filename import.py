@@ -365,31 +365,33 @@ class MemosClient:
                 f"Memos returned non-JSON response: {resp.text[:200]}"
             )
 
-    def patch_timestamps(self, memo_name: str, display_time: str) -> bool:
+    def patch_timestamps(self, memo_name: str, display_time: str) -> tuple:
         """
-        PATCH /api/v1/{memo_name} to set the historical timestamp on both displayTime
-        and createTime so the Memos calendar and timeline reflect the original date.
+        PATCH /api/v1/{memo_name}?updateMask=displayTime to set the historical timestamp.
 
-        Returns True on success, False on failure.
+        Returns (True, "") on success, or (False, reason_string) on failure.
         Never raises — timestamp backfill is best-effort.
+
+        Note: createTime is server-assigned and not patchable. displayTime is the field
+        Memos uses to sort and display entries in the timeline and calendar.
 
         memo_name: the resource name returned by create_memo, e.g. "memos/123"
         display_time: ISO 8601 UTC string, e.g. "2023-06-15T09:30:00Z"
         """
         url = self._api(f"/api/v1/{memo_name}")
-        payload = {"displayTime": display_time, "createTime": display_time}
+        payload = {"displayTime": display_time}
         try:
             resp = self.session.patch(
                 url,
                 json=payload,
-                params={"updateMask": "displayTime,createTime"},
+                params={"updateMask": "displayTime"},
                 timeout=self._timeout,
             )
             if resp.ok:
-                return True
-            return False
-        except Exception:
-            return False
+                return True, ""
+            return False, f"HTTP {resp.status_code}: {resp.text[:120]}"
+        except Exception as exc:
+            return False, str(exc)
 
 
     def list_daylio_memos(self) -> list:
@@ -576,13 +578,13 @@ def run_import(args: argparse.Namespace) -> None:
         memo_name = memo.get("name", "")
 
         if memo_name:
-            ok = client.patch_timestamps(memo_name, display_time)
+            ok, reason = client.patch_timestamps(memo_name, display_time)
             if not ok:
-                print(f"OK (WARN: could not set timestamps for {memo_name})")
+                print(f"OK (WARN: timestamp not set — {reason})")
             else:
                 print("OK")
         else:
-            print("OK (WARN: response missing 'name', could not set timestamps)")
+            print("OK (WARN: response missing 'name', timestamp not set)")
 
         succeeded += 1
         if state:
@@ -628,6 +630,12 @@ def run_delete(args: argparse.Namespace) -> None:
 
     if not memos:
         print("No memos with #daylio-import tag found.")
+        return
+
+    if args.dry_run:
+        print(f"\nDry run — would delete {len(memos)} memos (no changes made):")
+        for memo in memos:
+            print(f"  {memo.get('name', '?')}")
         return
 
     print(f"\nFound {len(memos)} memos to delete.")
