@@ -253,6 +253,41 @@ def build_content(entry: dict, mood_map: dict, tag_map: dict, args: argparse.Nam
 
 
 # ---------------------------------------------------------------------------
+# Layer B2 — Import State (duplicate detection)
+# ---------------------------------------------------------------------------
+
+class ImportState:
+    """Persists a set of imported Daylio entry datetime-ms values to a local JSON file.
+
+    Used to skip entries that were successfully imported in a previous run.
+    The state file is updated after each successful import so progress is never lost.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._imported: set = set()
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    self._imported = set(json.load(f).get("imported", []))
+            except Exception:
+                pass  # Corrupt state file → start empty
+
+    def is_imported(self, dt_ms: int) -> bool:
+        return dt_ms in self._imported
+
+    def mark(self, dt_ms: int) -> None:
+        self._imported.add(dt_ms)
+        with open(self.path, "w") as f:
+            json.dump({"imported": sorted(self._imported)}, f)
+
+    def clear(self) -> None:
+        self._imported = set()
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+
+# ---------------------------------------------------------------------------
 # Layer C — Memos API Client
 # ---------------------------------------------------------------------------
 
@@ -330,9 +365,10 @@ class MemosClient:
                 f"Memos returned non-JSON response: {resp.text[:200]}"
             )
 
-    def patch_display_time(self, memo_name: str, display_time: str) -> bool:
+    def patch_timestamps(self, memo_name: str, display_time: str) -> bool:
         """
-        PATCH /api/v1/{memo_name}?updateMask=displayTime to set the historical timestamp.
+        PATCH /api/v1/{memo_name} to set the historical timestamp on both displayTime
+        and createTime so the Memos calendar and timeline reflect the original date.
 
         Returns True on success, False on failure.
         Never raises — timestamp backfill is best-effort.
@@ -341,12 +377,12 @@ class MemosClient:
         display_time: ISO 8601 UTC string, e.g. "2023-06-15T09:30:00Z"
         """
         url = self._api(f"/api/v1/{memo_name}")
-        payload = {"displayTime": display_time}
+        payload = {"displayTime": display_time, "createTime": display_time}
         try:
             resp = self.session.patch(
                 url,
                 json=payload,
-                params={"updateMask": "displayTime"},
+                params={"updateMask": "displayTime,createTime"},
                 timeout=self._timeout,
             )
             if resp.ok:
@@ -354,6 +390,52 @@ class MemosClient:
             return False
         except Exception:
             return False
+
+
+    def list_daylio_memos(self) -> list:
+        """Fetch all memos that contain '#daylio-import', using pagination.
+
+        Returns a flat list of memo resource dicts.
+        Raises MemosAPIError if the API call fails.
+        """
+        memos = []
+        page_token = None
+        while True:
+            params: dict = {
+                "filter": 'content.contains("#daylio-import")',
+                "pageSize": 50,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            try:
+                resp = self.session.get(
+                    self._api("/api/v1/memos"), params=params, timeout=self._timeout
+                )
+            except requests.exceptions.RequestException as exc:
+                raise MemosAPIError(f"Network error while listing memos: {exc}") from exc
+            if not resp.ok:
+                raise MemosAPIError(
+                    f"Failed to list memos (HTTP {resp.status_code}): {resp.text[:200]}"
+                )
+            data = resp.json()
+            memos.extend(data.get("memos", []))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return memos
+
+    def delete_memo(self, memo_name: str) -> None:
+        """DELETE /api/v1/{memo_name}. Raises MemosAPIError on failure."""
+        try:
+            resp = self.session.delete(
+                self._api(f"/api/v1/{memo_name}"), timeout=self._timeout
+            )
+        except requests.exceptions.RequestException as exc:
+            raise MemosAPIError(f"Network error while deleting {memo_name}: {exc}") from exc
+        if not resp.ok:
+            raise MemosAPIError(
+                f"Failed to delete {memo_name} (HTTP {resp.status_code}): {resp.text[:200]}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -414,10 +496,18 @@ def run_import(args: argparse.Namespace) -> None:
         if skipped_empty:
             print(f"Skipping {skipped_empty} content-empty entries (--skip-empty).")
 
+    # --- Step 3c: Initialise state file for duplicate detection ---
+    state = None
+    if not args.dry_run and not args.no_state:
+        state = ImportState(args.state_file)
+        if state._imported:
+            print(f"State file loaded: {len(state._imported)} previously imported entries.")
+
     # --- Step 4: Import loop ---
     total = len(entries)
     succeeded = 0
     failed = 0
+    skipped_dup = 0
     failed_entries = []
 
     print()
@@ -428,7 +518,13 @@ def run_import(args: argparse.Namespace) -> None:
     for i, entry in enumerate(entries, start=1):
         entry_id = entry.get("id", "?")
         date_str = _entry_date_str(entry)
+        entry_dt_ms = entry.get("datetime", -1)
         prefix = f"[{i}/{total}]"
+
+        # Skip already-imported entries unless --ignore-state
+        if state and not args.ignore_state and state.is_imported(entry_dt_ms):
+            skipped_dup += 1
+            continue
 
         # Warn about assets (photos) — not supported
         asset_count = len(entry.get("assets", []))
@@ -461,6 +557,12 @@ def run_import(args: argparse.Namespace) -> None:
             memo = client.create_memo(content, args.visibility)
         except MemosAPIError as exc:
             print(f"ERROR: {exc}")
+            if exc.status_code == 400 and "content too long" in (exc.response_text or "").lower():
+                print(
+                    "  HINT: This entry exceeds the Memos content length limit.\n"
+                    "  To fix: go to Memos → Settings → System and increase\n"
+                    "  'Content length limit (byte)' to 15000 or higher, then re-run."
+                )
             failed += 1
             failed_entries.append((entry_id, date_str))
             continue
@@ -474,22 +576,28 @@ def run_import(args: argparse.Namespace) -> None:
         memo_name = memo.get("name", "")
 
         if memo_name:
-            ok = client.patch_display_time(memo_name, display_time)
+            ok = client.patch_timestamps(memo_name, display_time)
             if not ok:
-                print(f"OK (WARN: could not set displayTime for {memo_name})")
+                print(f"OK (WARN: could not set timestamps for {memo_name})")
             else:
                 print("OK")
         else:
-            print("OK (WARN: response missing 'name', could not set displayTime)")
+            print("OK (WARN: response missing 'name', could not set timestamps)")
 
         succeeded += 1
+        if state:
+            state.mark(entry_dt_ms)
 
         if args.delay > 0:
             time.sleep(args.delay)
 
     # --- Step 5: Summary ---
     print()
-    skipped_note = f", {skipped_empty} skipped (empty)" if skipped_empty else ""
+    skipped_note = ""
+    if skipped_empty:
+        skipped_note += f", {skipped_empty} skipped (empty)"
+    if skipped_dup:
+        skipped_note += f", {skipped_dup} skipped (already imported)"
     if args.dry_run:
         print(f"Dry run complete: {succeeded} entries would be imported{skipped_note}.")
     else:
@@ -498,6 +606,58 @@ def run_import(args: argparse.Namespace) -> None:
             print("Failed entries:")
             for eid, dstr in failed_entries:
                 print(f"  - Entry {eid} ({dstr})")
+
+
+def run_delete(args: argparse.Namespace) -> None:
+    """Delete all memos tagged #daylio-import from the Memos instance."""
+    print(f"Connecting to Memos at {args.memos_url} ...")
+    client = MemosClient(args.memos_url, args.token)
+    try:
+        client.check_connectivity()
+    except MemosAPIError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print("Connection OK.")
+
+    print("Fetching memos tagged #daylio-import ...")
+    try:
+        memos = client.list_daylio_memos()
+    except MemosAPIError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not memos:
+        print("No memos with #daylio-import tag found.")
+        return
+
+    print(f"\nFound {len(memos)} memos to delete.")
+    confirm = input("Type YES to confirm permanent deletion: ").strip()
+    if confirm != "YES":
+        print("Aborted.")
+        return
+
+    print()
+    failed = 0
+    for i, memo in enumerate(memos, 1):
+        name = memo.get("name", "")
+        print(f"[{i}/{len(memos)}] Deleting {name} ...", end=" ", flush=True)
+        try:
+            client.delete_memo(name)
+            print("OK")
+        except MemosAPIError as exc:
+            print(f"ERROR: {exc}")
+            failed += 1
+
+    # Offer to clear the state file
+    state_path = args.state_file
+    if os.path.exists(state_path):
+        print()
+        clear = input(f"Clear state file '{state_path}'? [y/N] ").strip().lower()
+        if clear == "y":
+            os.remove(state_path)
+            print("State file cleared.")
+
+    print(f"\nDeletion complete: {len(memos) - failed} deleted, {failed} failed.")
 
 
 # ---------------------------------------------------------------------------
@@ -516,9 +676,21 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--daylio",
-        required=True,
+        required=False,
         metavar="FILE",
-        help="Path to the .daylio backup file exported from the Daylio app.",
+        help=(
+            "Path to the .daylio backup file exported from the Daylio app. "
+            "Required unless --delete-imported is used."
+        ),
+    )
+    parser.add_argument(
+        "--delete-imported",
+        action="store_true",
+        help=(
+            "Delete all memos tagged #daylio-import from your Memos instance. "
+            "Interactive — requires typing YES to confirm. "
+            "--daylio is not required when this flag is used."
+        ),
     )
     parser.add_argument(
         "--memos-url",
@@ -575,17 +747,46 @@ def parse_args() -> argparse.Namespace:
         metavar="SECONDS",
         help="Seconds to sleep between API calls (default: 0.5). Use 0 to disable.",
     )
+    parser.add_argument(
+        "--state-file",
+        default="daylio-import-state.json",
+        metavar="PATH",
+        help=(
+            "Path to the JSON state file used to track imported entries and prevent duplicates "
+            "on re-runs (default: daylio-import-state.json in the current directory)."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-state",
+        action="store_true",
+        help=(
+            "Import all entries even if they are already recorded in the state file. "
+            "The state file is still updated with any newly imported entries."
+        ),
+    )
+    parser.add_argument(
+        "--no-state",
+        action="store_true",
+        help="Disable state file entirely — no duplicate detection, no state written.",
+    )
 
     args = parser.parse_args()
     # Normalise attribute name for use in code (memos_url vs memos-url)
     args.memos_url = args.memos_url.rstrip("/")
+
+    if not args.delete_imported and not args.daylio:
+        parser.error("--daylio is required unless --delete-imported is used")
+
     return args
 
 
 def main() -> None:
     try:
         args = parse_args()
-        run_import(args)
+        if args.delete_imported:
+            run_delete(args)
+        else:
+            run_import(args)
     except KeyboardInterrupt:
         print("\nAborted.", file=sys.stderr)
         sys.exit(1)
