@@ -191,7 +191,7 @@ def entry_to_timestamp(entry: dict) -> str:
     Returns e.g. "2023-06-15T09:30:00Z".
     """
     ms = entry.get("datetime", 0)
-    dt = datetime.utcfromtimestamp(ms / 1000)
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).replace(tzinfo=None)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -336,14 +336,14 @@ class MemosClient:
                 response_text=resp.text,
             )
 
-    def create_memo(self, content: str, visibility: str) -> dict:
+    def create_memo(self, content: str, visibility: str, display_time: str) -> dict:
         """
         POST /api/v1/memos to create a new memo.
         Returns the parsed JSON response dict.
         Raises MemosAPIError on non-2xx.
         """
         url = self._api("/api/v1/memos")
-        payload = {"content": content, "visibility": visibility}
+        payload = {"content": content, "visibility": visibility, "displayTime": display_time}
         try:
             resp = self.session.post(url, json=payload, timeout=self._timeout)
         except requests.exceptions.Timeout:
@@ -384,7 +384,7 @@ class MemosClient:
             resp = self.session.patch(
                 url,
                 json=payload,
-                params={"updateMask": "displayTime"},
+                params={"updateMask": "display_time"},
                 timeout=self._timeout,
             )
             if resp.ok:
@@ -448,7 +448,7 @@ def _entry_date_str(entry: dict) -> str:
     """Return a human-readable date string for an entry (for logging)."""
     try:
         ms = entry.get("datetime", 0)
-        dt = datetime.utcfromtimestamp(ms / 1000)
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).replace(tzinfo=None)
         return dt.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return "(unknown date)"
@@ -556,7 +556,7 @@ def run_import(args: argparse.Namespace) -> None:
         print(f"{prefix} Importing entry {entry_id} ({date_str}) ...", end=" ", flush=True)
 
         try:
-            memo = client.create_memo(content, args.visibility)
+            memo = client.create_memo(content, args.visibility, display_time)
         except MemosAPIError as exc:
             print(f"ERROR: {exc}")
             if exc.status_code == 400 and "content too long" in (exc.response_text or "").lower():
@@ -608,6 +608,12 @@ def run_import(args: argparse.Namespace) -> None:
             print("Failed entries:")
             for eid, dstr in failed_entries:
                 print(f"  - Entry {eid} ({dstr})")
+        print()
+        print(
+            "Note: If entry dates still show as today in the Memos timeline or calendar,\n"
+            "enable 'Display with updated time' in Memos → Settings → System so Memos\n"
+            "uses the imported displayTime instead of the server creation time."
+        )
 
 
 def run_delete(args: argparse.Namespace) -> None:
